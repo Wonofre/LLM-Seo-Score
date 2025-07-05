@@ -1,0 +1,399 @@
+# 📜 LLM-SEO Score — **Fonte Única de Verdade**
+
+*Codinome interno: **Vibe Coding** · rev. `v3.0 – 2025-07-05`*
+
+> Este documento consolida **todas** as decisões técnicas, de produto e de governança feitas até o momento.
+> Pontos “☁︎ Maleáveis” indicam áreas onde ajustes ainda são esperados; qualquer mudança fora dessas zonas exige *Design Review* formal.
+
+---
+
+### 🗺️ Sumário
+
+0. TL;DR executivo (1 min)
+1. Visão & Problema que resolvemos
+2. Princípios-guia
+3. Personas & “Jobs-to-Be-Done”
+4. Cronograma realista (Marcos −1 → 3)
+5. Arquitetura macro (Supabase-centric revisada)
+6. Componentes & Decisões de Stack (🏆 fixos × ☁︎ maleáveis)
+7. Fluxo de dados ponta-a-ponta
+8. Modelo de dados Supabase + esquemas SQL
+9. Algoritmo de Score v0.1 (calibração & versionamento)
+10. Camada AI Question Generator & Governança de Prompts
+11. Segurança · LGPD · Proveniência
+12. Observabilidade, SLOs & Custos-alvo
+13. Setup local + .env example
+14. Git Flow, CI/CD, Lovable scaffold
+15. Riscos ↔ Mitigações
+16. Glossário Rápido
+
+---
+
+## 0. TL;DR Executivo
+
+| Ponto-chave      | Estado                                                                                                   |
+| ---------------- | -------------------------------------------------------------------------------------------------------- |
+| **MVP alcance**  | 30 domínios, score 0-100, comparativo e tendência mensal.                                                |
+| **Prazo**        | 18 semanas totais (PoC + 3 marcos).                                                                      |
+| **Custo piloto** | \~US\$ 165/mês (detalhe §12).                                                                            |
+| **Stack**        | Supabase (PG 15, Timescale, pgvector) + Prefect + Firecrawl/Apify + LangChain + Next.js + Grafana Cloud. |
+| **Validação**    | Correl ≥ 0.60 com Search Console CTR; NPS early adopters > 40.                                           |
+| **Risco topo**   | Timescale ext. deprecada em PG 17; plano B já definido.                                                  |
+
+---
+
+<a id="1"></a>
+
+## 1. Visão & Problema
+
+**Busca generativa + LLMs** deslocam o clássico “10 links azuis”. Marcas querem saber:
+
+* “Sou citado no bloco AI Overview ou pelo ChatGPT?”
+* “Por que meu competidor aparece e eu não?”
+
+**LLM-SEO Score** provê um **índice quantitativo** + recomendações para elevar visibilidade orgânica e nas respostas de IA, medindo:
+
+1. **Menções** (texto eimplied-links) na Web, SGE e LLMs
+2. **Sentimento** das menções
+3. **Backlinks & autoridade clássica**
+4. **Presença competitiva**
+
+---
+
+<a id="2"></a>
+
+## 2. Princípios-guia
+
+| ID   | Princípio                | Nota                                                       |
+| ---- | ------------------------ | ---------------------------------------------------------- |
+| P-01 | **Build on Open**        | OSS + free tier sempre que possível.                       |
+| P-02 | **Reprodutibilidade**    | Hashes, lineage, versionamento de modelo/score.            |
+| P-03 | **Fail-small**           | PoC 1 domínio → 5 → 30.                                    |
+| P-04 | **No vendor-lock**       | Dados exportáveis, APIs públicas.                          |
+| P-05 | **Privacy-first**        | Só conteúdo público; PII anonimiz.                         |
+| P-06 | **Prompt-transparency**  | Repo de prompts; diff em CI.                               |
+| P-07 | **Prompt-extensibility** | Template novo via PR > review, **sem** hot-reload runtime. |
+| P-08 | **Cost guardrails**      | Alertas se gasto > 80 % budget.                            |
+
+---
+
+<a id="3"></a>
+
+## 3. Personas & JTBD
+
+| Persona         | Objetivo (Job)                                                                        |
+| --------------- | ------------------------------------------------------------------------------------- |
+| **CMO**         | Ver posição da marca vs. concorrentes nos blocos de IA, entender ações para melhorar. |
+| **SEO Lead**    | Correlacionar backlinks/menções com ranking, validar experimentos.                    |
+| **Growth Eng.** | Incluir score em dashboards internos via API.                                         |
+| **Data Sci**    | Ajustar pesos do score com base em métricas reais.                                    |
+
+---
+
+<a id="4"></a>
+
+## 4. Cronograma Realista
+
+| Mar                    | Duraç. | Entregas chave                                                 | Gate / Métrica                |
+| ---------------------- | ------ | -------------------------------------------------------------- | ----------------------------- |
+| **−1** *Validação*     | 2 sem  | Crawl + score básico 1 domínio                                 | Go se corr ≥0.3, custo <10 \$ |
+| **0** *MVP Core*       | 6 sem  | Crawlers Firecrawl/Apify; Supabase; score v0.1                 | corr ≥0.3 em 5 domínios       |
+| **1** *Enrichment*     | 4 sem  | Embeddings + competidores; GPT-4o ping; cache Redis            | Precision compet. ≥0.8        |
+| **2** *UX & Multi-LLM* | 4 sem  | Dashboard Next.js; Gemini+Llama-3 via Groq; alertas GrowthBook | NPS ≥40                       |
+| **3** *Beta Público*   | 2 sem  | 30 domínios, partições PG17, cost guardrails                   | Retenção 1 mês ≥70 %          |
+
+Total *18 semanas*. Prazos incluem buffer 20 %.
+
+---
+
+<a id="5"></a>
+
+## 5. Arquitetura Macro (rev.)
+
+```mermaid
+flowchart TD
+    subgraph Data
+      FC(Firecrawl)
+      AP(Apify SGE)
+      PFX(Prefect)
+    end
+    subgraph NLP
+      EMB(Embeddings SBERT-pt)
+      VEC(pgvector)
+      HDB(HDBSCAN)
+    end
+    subgraph IA
+      QG(AI Question<br>Generator GPT-4o)
+      PP(Ping-Prompt<br>GPT-4o + Gemini + Llama-3)
+    end
+    subgraph Core
+      SCR(Rule Engine YAML)
+      TS(Timescale hypertable)
+    end
+    subgraph Serv
+      API(FastAPI + Supabase RLS)
+      UI(Next.js + ECharts)
+    end
+    FC -->|HTML| PFX
+    AP --> PFX
+    PFX --> EMB --> VEC
+    VEC --> HDB --> QG
+    QG --> PP --> SCR
+    PFX --> SCR   %% backlinks, sentiment
+    SCR --> TS --> API --> UI
+```
+
+---
+
+<a id="6"></a>
+
+## 6. Stack (🏆 fixo / ☁︎ maleável)
+
+| Camada              | Escolha                                | Estado | Notas                                  |
+| ------------------- | -------------------------------------- | ------ | -------------------------------------- |
+| **Orquestração**    | Prefect 2 Core + Cloud Free            | 🏆     | Agents on-prem; 3 k runs/mês free      |
+| **Storage**         | Supabase PG 15                         | 🏆     | `timescaledb` + `pgvector`             |
+| **Vector alt.**     | Qdrant Docker                          | ☁︎     | Só se >3 M vetores ou latência crítica |
+| **Crawling**        | Firecrawl                              | 🏆     | 500 credits/mo free                    |
+|                     | Apify Google Search Scraper            | 🏆     | AI Overview JSON                       |
+| **Proxy**           | embed Apify Proxy                      | 🏆     | Extra if Playwright fallback           |
+| **Embeddings**      | SBERT-pt (MiniLM-L12-v2)               | 🏆     | HF Hub free                            |
+| **LLM Abstraction** | LangChain + LangSmith Free             | 🏆     | Token logging                          |
+| **LLMs**            | GPT-4o · Gemini 1.5 · Groq Llama-3-70B | 🏆     | Redis TTL cache 7 d                    |
+| **Score Engine**    | json-rules-engine                      | 🏆     | YAML weights hot-reload via CI         |
+| **Prompt Mgmt**     | Prompts only via Git PR                | 🏆     | No runtime upload                      |
+| **Observability**   | OTEL → Prom+Grafana Cloud+Loki         | 🏆     | Free logs 50 GB /14 d                  |
+| **Dashboard**       | Next.js 14 + ECharts                   | 🏆     | Auth future via Supabase               |
+| **Experimentação**  | GrowthBook Cloud Free                  | 🏆     | 5 M eval/mo free                       |
+
+---
+
+<a id="7"></a>
+
+## 7. Modelo de Dados — Supabase
+
+```sql
+-- prompts (curados via PR)
+create table prompts (
+  id uuid primary key default gen_random_uuid(),
+  name text unique,
+  template text,
+  type text,          -- compare | feature | rep
+  active bool default true
+);
+
+-- questions
+create table questions(
+  id uuid primary key default gen_random_uuid(),
+  batch_id uuid,
+  brand text,
+  competitor text,    -- null if feature query
+  prompt_id uuid references prompts(id),
+  created_at timestamptz default now()
+);
+
+-- answers
+create table answers(
+  question_id uuid references questions(id),
+  model text,
+  raw text,
+  pos int, neg int,
+  mention_brand int,
+  mention_comp int,
+  tokens_in int, tokens_out int,
+  captured_at timestamptz default now()
+);
+
+-- embeddings (pgvector 384)
+create extension if not exists vector;
+create table embeddings(
+  id uuid primary key default gen_random_uuid(),
+  company text,
+  content text,
+  vec vector(384)
+);
+create index on embeddings using ivfflat(vec vector_l2_ops) with (lists=100);
+
+-- scores (timescaledb)
+create extension if not exists timescaledb;
+create table scores(
+  company text,
+  captured timestamptz,
+  score numeric,
+  version text references score_versions(version),
+  primary key(company, captured)
+);
+select create_hypertable('scores', by_range('captured'));
+
+-- score versioning
+create table score_versions(
+  version text primary key,
+  algo_hash text,
+  weights jsonb,
+  created timestamptz default now(),
+  deprecated timestamptz
+);
+```
+
+---
+
+<a id="8"></a>
+
+## 8. Algoritmo de Score v0.1
+
+```python
+def compute_score(features, w):
+    raw = (
+        w.backlinks * log1p(features.backlinks) +
+        w.mentions  * sqrt(features.mentions_web) +
+        w.sent      * (features.sent_pos - features.sent_neg) +
+        w.ai_bonus  * features.ai_overview +
+        w.llm       * features.llm_citations +
+        w.comp_sent * features.compare_sentiment +
+        w.feat_ment * features.feature_mentions +
+        w.pair_win  * features.pairwise_wins
+    )
+    return 100 / (1 + exp(-raw))          # logistic squash
+```
+
+* **Calibração** em PoC: ridge regression contra `log(CTR)`.
+* Pesos salvos em `score_versions`.
+* ☁︎ Maleável → podemos trocar logistic por min-max depois de avaliação.
+
+---
+
+<a id="9"></a>
+
+## 9. AI Question Generator & Prompts
+
+* **Gerador**: GPT-4o prompt:
+
+  ```
+  You are a question generator. Given a brand and competitor,
+  output JSON with 3 comparative questions and 3 feature questions...
+  ```
+* **Var**: 1 variação/prompt Sprint 0, máximo 3 depois.
+* **Cache**: Redis key = `sha256(prompt+brand+comp)`.
+* **Governança:** prompts vivem em `/prompts/` e na tabela. CI bloqueia:
+
+  * > 120 tokens
+  * placeholder ausente
+  * regex blacklist (`drop table`, `<script>`, etc.)
+
+---
+
+<a id="10"></a>
+
+## 10. Segurança · LGPD · Proveniência
+
+* **Anonimização**: Presidio + custom regex (CPF, CNPJ).
+* **Lineage**: OpenLineage events via Prefect → Marquez UI.
+* **PII policy**: se campo `raw` contém `<MASK>` ≤ 0.5 % falsos negativos (test semanal).
+* **Access**: Supabase RLS per-tenant; API JWT.
+
+---
+
+<a id="11"></a>
+
+## 11. Variáveis `.env.example` (excerp.)
+
+```env
+# SUPABASE
+SUPABASE_URL=https://xyz.supabase.co
+SUPABASE_ANON_KEY=pk_...
+SUPABASE_SERVICE_ROLE=service_role_...
+
+# PREFECT
+PREFECT_API_URL=https://api.prefect.cloud/api
+PREFECT_API_KEY=<key>
+
+# LLM
+OPENAI_API_KEY=
+GEMINI_API_KEY=
+GROQ_API_KEY=
+REDIS_URL=redis://localhost:6379
+
+# CRAWL
+FIRECRAWL_API_KEY=
+APIFY_TOKEN=
+
+PROMPT_DIR=./prompts
+```
+
+---
+
+<a id="12"></a>
+
+## 12. Observabilidade & Custos-alvo
+
+| Métrica          | SLO          | Tool             |
+| ---------------- | ------------ | ---------------- |
+| `GET /score` p95 | < 3 s        | Prom + Grafana   |
+| Crawler error %  | < 2 %        | Loki alert       |
+| Cost tokens/day  | < 5 \$       | custom exporter  |
+| Disk Supabase    | < 50 % quota | Supabase monitor |
+
+**Budget** piloto (30 domínios) ≈ **US\$ 165/mês** (§0).
+
+---
+
+<a id="13"></a>
+
+## 13. Setup Local
+
+```bash
+git clone git@github.com:vibecoding/llm-seo-score.git
+cd llm-seo-score
+cp .env.example .env
+docker compose up -d         # supabase-local, redis, grafana+otel
+poetry install
+prefect worker start --pool default
+prefect deployment run demo-one-domain   # smoke test
+```
+
+---
+
+<a id="14"></a>
+
+## 14. GitFlow, CI/CD
+
+* **Lovable** scaffold: directories + Docker compose.
+* **Branching**: `main`, `feat/*`, `fix/*`, `docs/*`.
+* **CI jobs** (`.github/workflows`):
+
+  * `lint-test` (`ruff`, `black`, `pytest`)
+  * `validate-prompts` (`scripts/check_prompts.py`)
+  * `build` (docker)
+* **CD**: optional — manual deploy to fly.io for API/dashboard.
+
+---
+
+<a id="15"></a>
+
+## 15. Riscos ↔ Mitigações (v3)
+
+| Risco                    | Impacto         | Mitigação                                  |
+| ------------------------ | --------------- | ------------------------------------------ |
+| Timescale ext. drop PG17 | sem hypertable  | script partições nativas; eval QuestDB     |
+| SGE HTML change          | parser quebra   | nightly snapshot test, fallback Playwright |
+| Cost spike OpenAI        | perda orçamento | Redis cache + degrade GPT-3.5 / Llama      |
+| Competitor recall baixo  | score inútil    | manual YAML fallback list                  |
+| Prompt injecção          | output tóxico   | CI validation + content-filter             |
+
+---
+
+<a id="16"></a>
+
+## 16. Glossário
+
+* **AI Overview / SGE** — Resumo gerado pelo Google no topo da SERP
+* **Ping-prompt** — Pergunta padrão enviada a LLM para medir citações
+* **HDBSCAN** — Clustering por densidade escalável
+* **Hypertable** — TimescaleDB tabela particionada por tempo
+* **OpenLineage** — Padrão CNCF para linhagem de dados
+
+---
+
+> **Este documento é canônico.**
+> Para alterações: abrir PR com label `#truth-update`, preencher campo “Justificativa”.
+> Última revisão aprovada por **Tech Lead**, **Product Manager**, **LGPD Officer**.
